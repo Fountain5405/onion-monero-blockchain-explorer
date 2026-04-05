@@ -700,14 +700,16 @@ index2(uint64_t page_no = 0, bool refresh_page = false)
         // initialize the first list with transaction for solving
         // the block i.e. coinbase.
         vector<cryptonote::transaction> blk_txs {blk.miner_tx};
+        vector<crypto::hash> missed_txs;
 
-        // Use fast path to avoid expensive signature verification
-        if (!get_transactions_fast(blk.tx_hashes, blk_txs))
+        if (!core_storage->get_transactions(blk.tx_hashes, blk_txs, missed_txs))
         {
             cerr << "Cant get transactions in block: " << i << endl;
             --i;
             continue;
         }
+
+        (void) missed_txs;
 
         uint64_t tx_i {0};
 
