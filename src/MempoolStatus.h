@@ -163,10 +163,6 @@ struct MempoolStatus
     static mempool_txs_ptr
     get_mempool_txs();
 
-    // Returns first no_of_tx transactions (still uses shared_ptr internally)
-    static mempool_txs_ptr
-    get_mempool_txs(uint64_t no_of_tx);
-
     static bool
     is_thread_running();
 };

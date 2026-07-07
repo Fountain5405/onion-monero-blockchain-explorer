@@ -315,9 +315,10 @@ MicroCore::get_device() const
 }
 
 /**
- * Get transaction without expensive signature verification.
- * Uses parse_and_validate_tx_base_from_blob() which skips
- * bulletproof expansion, avoiding ~60% of CPU (no scalarmultKey).
+ * Get transaction without deserializing its prunable data
+ * (bulletproofs/CLSAGs). The base-only parse leaves the tx flagged
+ * pruned, so the true hash and blob size must be supplied from the
+ * database for get_tx_details() to report correct values.
  */
 bool
 MicroCore::get_tx_fast(const crypto::hash& tx_hash, transaction& tx)
@@ -338,14 +339,33 @@ MicroCore::get_tx_fast(const crypto::hash& tx_hash, transaction& tx)
             return false;
         }
 
-        // Parse without expensive signature verification
-        // Uses base_only=true which skips bulletproof expansion (no scalarmultKey)
         if (!cryptonote::parse_and_validate_tx_base_from_blob(
                 cryptonote::blobdata_ref{tx_blob.data(), tx_blob.size()}, tx))
         {
             cerr << "MicroCore::get_tx_fast: parse_and_validate_tx_base_from_blob failed" << endl;
             return false;
         }
+
+        // v1 txs cannot be hashed in pruned form, and their prunable part
+        // (ring signatures) is cheap to parse anyway
+        crypto::hash prunable_hash;
+        if (tx.version == 1
+            || !m_blockchain_storage.get_db().get_prunable_tx_hash(tx_hash, prunable_hash))
+        {
+            if (!cryptonote::parse_and_validate_tx_from_blob(
+                    cryptonote::blobdata_ref{tx_blob.data(), tx_blob.size()}, tx))
+            {
+                cerr << "MicroCore::get_tx_fast: full parse fallback failed for " << tx_hash << endl;
+                return false;
+            }
+        }
+        else
+        {
+            tx.set_prunable_hash(prunable_hash);
+        }
+
+        tx.set_hash(tx_hash);
+        tx.set_blob_size(tx_blob.size());
 
         return true;
     }

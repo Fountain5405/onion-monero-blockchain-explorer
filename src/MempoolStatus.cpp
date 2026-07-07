@@ -325,22 +325,6 @@ MempoolStatus::get_mempool_txs()
     return mempool_txs;
 }
 
-MempoolStatus::mempool_txs_ptr
-MempoolStatus::get_mempool_txs(uint64_t no_of_tx)
-{
-    Guard lck (mempool_mutx);
-
-    if (!mempool_txs)
-        return std::make_shared<vector<mempool_tx>>();
-
-    no_of_tx = std::min<uint64_t>(no_of_tx, mempool_txs->size());
-
-    // For partial access, we still need to create a new vector
-    // but this is rare and typically for small subsets
-    return std::make_shared<vector<mempool_tx>>(
-        mempool_txs->begin(), mempool_txs->begin() + no_of_tx);
-}
-
 bool
 MempoolStatus::is_thread_running()
 {

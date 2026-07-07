@@ -871,10 +871,9 @@ index2(uint64_t page_no = 0, bool refresh_page = false)
 string
 mempool(bool add_header_and_footer = false, uint64_t no_of_mempool_tx = 25)
 {
-    // Use shared_ptr to avoid deep copy of mempool transactions
-    auto mempool_txs = add_header_and_footer
-        ? MempoolStatus::get_mempool_txs()
-        : MempoolStatus::get_mempool_txs(no_of_mempool_tx);
+    // Shared snapshot of the mempool; no copy is made since the
+    // display loop below is bounded by no_of_mempool_tx anyway
+    auto mempool_txs = MempoolStatus::get_mempool_txs();
 
     if (!mempool_txs)
         mempool_txs = std::make_shared<std::vector<MempoolStatus::mempool_tx>>();
@@ -974,7 +973,7 @@ mempool(bool add_header_and_footer = false, uint64_t no_of_mempool_tx = 25)
 
     // this is for partial disply on front page.
 
-    context["mempool_fits_on_front_page"]    = (total_no_of_mempool_tx <= mempool_txs->size());
+    context["mempool_fits_on_front_page"]    = (total_no_of_mempool_tx <= no_of_mempool_tx);
     context["no_of_mempool_tx_of_frontpage"] = no_of_mempool_tx;
 
     context["partial_mempool_shown"] = true;
@@ -5903,14 +5902,14 @@ json_version()
     return j_response;
 }
 
-// Helper to get transactions without expensive signature verification
-// Uses get_tx_fast() which avoids bulletproof expansion (~60% CPU savings)
+// Helper to get transactions without deserializing their prunable data.
+// Appends to blk_txs like Blockchain::get_transactions, so callers can
+// seed the vector with the coinbase tx.
 bool
 get_transactions_fast(const std::vector<crypto::hash>& tx_hashes,
                      std::vector<cryptonote::transaction>& blk_txs)
 {
-    blk_txs.clear();
-    blk_txs.reserve(tx_hashes.size());
+    blk_txs.reserve(blk_txs.size() + tx_hashes.size());
 
     for (const auto& tx_hash : tx_hashes)
     {
@@ -6707,8 +6706,12 @@ get_tx_details(const transaction& tx,
     tx_details txd;
 
     // get tx hash
-    
-    if (!tx.pruned)
+
+    if (tx.is_hash_valid())
+    {
+        txd.hash = tx.hash;
+    }
+    else if (!tx.pruned)
     {
         txd.hash = get_transaction_hash(tx);
     }
@@ -6749,8 +6752,10 @@ get_tx_details(const transaction& tx,
 
     get_payment_id(tx, txd.payment_id, txd.payment_id8);
 
-    // get tx size in bytes
-    txd.size = get_object_blobsize(tx);
+    // get tx size in bytes; a base-only parsed tx serializes without its
+    // prunable data, so prefer the cached full blob size when available
+    txd.size = tx.is_blob_size_valid()
+            ? tx.blob_size : get_object_blobsize(tx);
 
     txd.extra = tx.extra;
 
