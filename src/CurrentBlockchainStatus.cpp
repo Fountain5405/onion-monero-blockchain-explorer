@@ -142,7 +142,10 @@ CurrentBlockchainStatus::calculate_emission_in_blocks(
 
         uint64_t tx_fee_amount = 0;
 
-        core_storage->get_transactions(blk.tx_hashes, txs, missed_txs);
+        // fees only need the tx prefix (v1) or rct base (v2), so fetch
+        // pruned txs; this reads and parses far less data, which makes
+        // the initial from-genesis emission scan much faster
+        core_storage->get_transactions(blk.tx_hashes, txs, missed_txs, true);
 
         for(const auto& tx: txs)
         {

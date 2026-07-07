@@ -65,6 +65,7 @@ inline thread_local RandomXThreadCleanup rx_thread_cleanup;
 }
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <ctime>
 #include <future>
@@ -700,16 +701,15 @@ index2(uint64_t page_no = 0, bool refresh_page = false)
         // initialize the first list with transaction for solving
         // the block i.e. coinbase.
         vector<cryptonote::transaction> blk_txs {blk.miner_tx};
-        vector<crypto::hash> missed_txs;
 
-        if (!core_storage->get_transactions(blk.tx_hashes, blk_txs, missed_txs))
+        // list views only need prefix + rct base data, so skip
+        // deserializing bulletproofs/CLSAGs
+        if (!get_transactions_fast(blk.tx_hashes, blk_txs))
         {
             cerr << "Cant get transactions in block: " << i << endl;
             --i;
             continue;
         }
-
-        (void) missed_txs;
 
         uint64_t tx_i {0};
 
@@ -1196,7 +1196,9 @@ show_block(uint64_t _blk_height)
         // get transaction
         transaction tx;
 
-        if (!mcore->get_tx(tx_hash, tx))
+        // block page only shows tx summaries, so the prunable
+        // data (bulletproofs/CLSAGs) is not needed
+        if (!mcore->get_tx_fast(tx_hash, tx))
         {
             cerr << "Cant get tx: " << tx_hash << endl;
             continue;
@@ -4864,7 +4866,9 @@ json_block(string block_no_or_hash)
         // get transaction
         transaction tx;
 
-        if (!mcore->get_tx(tx_hash, tx))
+        // json block listing only needs tx summaries, so the
+        // prunable data (bulletproofs/CLSAGs) is not needed
+        if (!mcore->get_tx_fast(tx_hash, tx))
         {
             j_response["status"]  = "error";
             j_response["message"]
@@ -5637,16 +5641,14 @@ json_outputsblocks(string startblock,
 
         uint64_t no_mempool_txs = mempool_txs ? mempool_txs->size() : 0;
 
-        // need to use vector<transactions>,
-        // not vector<MempoolStatus::mempool_tx>
-        vector<transaction> tmp_vector;
+        // find_our_outputs only reads the txs, so reference the
+        // shared mempool snapshot instead of copying every tx
+        vector<std::reference_wrapper<const transaction>> tmp_vector;
         tmp_vector.reserve(no_mempool_txs);
 
         for (size_t i = 0; i < no_mempool_txs; ++i)
         {
-            // get transaction info of the tx in the mempool
-            // Note: we copy the tx here since the shared_ptr data is read-only
-            tmp_vector.push_back(mempool_txs->at(i).tx);
+            tmp_vector.emplace_back(mempool_txs->at(i).tx);
         }
 
         if (!find_our_outputs(
