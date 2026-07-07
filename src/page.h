@@ -96,7 +96,7 @@ inline thread_local RandomXThreadCleanup rx_thread_cleanup;
 #define TMPL_MY_CHECKRAWOUTPUTKEYS  TMPL_DIR "/checkrawoutputkeys.html"
 
 #define ONIONEXPLORER_RPC_VERSION_MAJOR 1
-#define ONIONEXPLORER_RPC_VERSION_MINOR 2
+#define ONIONEXPLORER_RPC_VERSION_MINOR 3
 #define MAKE_ONIONEXPLORER_RPC_VERSION(major,minor) (((major)<<16)|(minor))
 #define ONIONEXPLORER_RPC_VERSION \
     MAKE_ONIONEXPLORER_RPC_VERSION(ONIONEXPLORER_RPC_VERSION_MAJOR, ONIONEXPLORER_RPC_VERSION_MINOR)
@@ -5758,10 +5758,9 @@ json_networkinfo()
     //    return j_response;
     }
 
-    uint64_t fee_estimated {0};
-
     j_info["fee_per_kb"] = per_kb_fee_estimated;
-    j_info["fee_estimate"] = fee_estimated;
+    j_info["fee_estimate"] = per_kb_fee_estimated;
+    j_info["fee_estimate_grace_blocks"] = FEE_ESTIMATE_GRACE_BLOCKS;
 
     j_info["tx_pool_size"]        = MempoolStatus::mempool_no.load();
     j_info["tx_pool_size_kbytes"] = MempoolStatus::mempool_size.load();
@@ -5769,6 +5768,64 @@ json_networkinfo()
     j_data = j_info;
 
     j_response["status"]  = "success";
+
+    return j_response;
+}
+
+
+/*
+* Lets use this json api convention for success and error
+* https://labs.omniti.com/labs/jsend
+*/
+json
+json_feeestimate(string grace_blocks_str)
+{
+    json j_response {
+            {"status", "fail"},
+            {"data",   json {}}
+    };
+
+    json& j_data = j_response["data"];
+
+    uint64_t grace_blocks {FEE_ESTIMATE_GRACE_BLOCKS};
+
+    if (!grace_blocks_str.empty())
+    {
+        try
+        {
+            grace_blocks = boost::lexical_cast<uint64_t>(grace_blocks_str);
+        }
+        catch (const boost::bad_lexical_cast &e)
+        {
+            j_response["message"] = fmt::format(
+                    "Cant parse grace_blocks number: {:s}",
+                    grace_blocks_str);
+            return j_response;
+        }
+    }
+
+    uint64_t fee_estimated {0};
+    string error_msg;
+
+    if (!rpc.get_dynamic_per_kb_fee_estimate(
+            grace_blocks,
+            fee_estimated,
+            error_msg))
+    {
+        j_response["status"] = "error";
+        j_response["message"] = error_msg.empty()
+                                ? "Cant get dynamic fee estimate"
+                                : error_msg;
+        return j_response;
+    }
+
+    j_data = json {
+            {"fee", fee_estimated},
+            {"fee_per_kb", fee_estimated},
+            {"grace_blocks", grace_blocks}
+    };
+
+    j_response["status"] = "success";
 
     return j_response;
 }
@@ -7142,4 +7199,3 @@ get_tx_amount_output_indices(vector<uint64_t>& out_amount_indices, Args&&... arg
 }
 
 #endif //CROWXMR_PAGE_H
-

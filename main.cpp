@@ -753,6 +753,19 @@ main(int ac, const char* av[])
             return r;
         });
 
+        CROW_ROUTE(app, "/api/feeestimate").methods("GET"_method)
+        ([&](const crow::request &req) {
+
+            string grace_blocks = regex_search(
+                    req.raw_url, regex {"grace_blocks=\\d+"}) ?
+                                  req.url_params.get("grace_blocks") : "";
+
+            myxmr::jsonresponse r{xmrblocks.json_feeestimate(
+                    remove_bad_chars(grace_blocks))};
+
+            return r;
+        });
+
         CROW_ROUTE(app, "/api/emission")
         ([&]() {
 

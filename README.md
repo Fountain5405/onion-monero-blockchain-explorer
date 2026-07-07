@@ -736,6 +736,8 @@ curl  -w "\n" -X GET "http://127.0.0.1:8081/api/networkinfo"
     "block_size_limit": 600000,
     "cumulative_difficulty": 2091549555696348,
     "difficulty": 7941560081,
+    "fee_estimate": 303970000,
+    "fee_estimate_grace_blocks": 10,
     "fee_per_kb": 303970000,
     "grey_peerlist_size": 4991,
     "hash_rate": 66179667,
@@ -751,6 +753,29 @@ curl  -w "\n" -X GET "http://127.0.0.1:8081/api/networkinfo"
     "tx_count": 1219048,
     "tx_pool_size": 2,
     "white_peerlist_size": 1000
+  },
+  "status": "success"
+}
+```
+
+#### api/feeestimate
+
+Current dynamic base fee estimate from the connected Monero daemon. The
+optional `grace_blocks` parameter defaults to 10.
+
+```bash
+curl  -w "\n" -X GET "http://127.0.0.1:8081/api/feeestimate"
+curl  -w "\n" -X GET "http://127.0.0.1:8081/api/feeestimate?grace_blocks=20"
+```
+
+Example result:
+
+```json
+{
+  "data": {
+    "fee": 303970000,
+    "fee_per_kb": 303970000,
+    "grace_blocks": 10
   },
   "status": "success"
 }
