@@ -5859,14 +5859,12 @@ json_emission()
         CurrentBlockchainStatus::Emission current_values
                 = CurrentBlockchainStatus::get_emission();
 
-        string emission_blk_no   = std::to_string(current_values.blk_no - 1);
-        string emission_coinbase = xmr_amount_to_str(current_values.coinbase, "{:0.3f}");
-        string emission_fee      = xmr_amount_to_str(current_values.fee, "{:0.4f}", false);
-
+        // coinbase does not fit into a json integer (uint64_t) anymore,
+        // so the amounts, in atomic units, are given as decimal strings
         j_data = json {
                 {"blk_no"  , current_values.blk_no - 1},
-                {"coinbase", current_values.coinbase},
-                {"fee"     , current_values.fee},
+                {"coinbase", current_values.coinbase.str()},
+                {"fee"     , current_values.fee.str()},
         };
     }
 

@@ -19,11 +19,26 @@ CurrentBlockchainStatus::set_blockchain_variables(MicroCore* _mcore,
     core_storage =_core_storage;
 }
 
+CurrentBlockchainStatus::Emission
+CurrentBlockchainStatus::get_total_emission()
+{
+    lock_guard<mutex> lock {total_emission_mutex};
+
+    return total_emission;
+}
+
+void
+CurrentBlockchainStatus::set_total_emission(const Emission& emission)
+{
+    lock_guard<mutex> lock {total_emission_mutex};
+
+    total_emission = emission;
+}
 
 void
 CurrentBlockchainStatus::start_monitor_blockchain_thread()
 {
-    total_emission_atomic = Emission {0, 0, 0};
+    set_total_emission(Emission {0, 0, 0});
 
     string emmision_saved_file = get_output_file_path().string();
 
@@ -53,7 +68,7 @@ CurrentBlockchainStatus::start_monitor_blockchain_thread()
                {
                    while (true)
                    {
-                       Emission current_emission = total_emission_atomic;
+                       Emission current_emission = get_total_emission();
 
                        current_height = core_storage->get_current_blockchain_height();
 
@@ -98,7 +113,7 @@ void
 CurrentBlockchainStatus::update_current_emission_amount()
 {
 
-    Emission current_emission = total_emission_atomic;
+    Emission current_emission = get_total_emission();
 
     uint64_t blk_no = current_emission.blk_no;
 
@@ -120,7 +135,7 @@ CurrentBlockchainStatus::update_current_emission_amount()
     current_emission.fee      += emission_calculated.fee;
     current_emission.blk_no    = emission_calculated.blk_no;
 
-    total_emission_atomic = current_emission;
+    set_total_emission(current_emission);
 }
 
 CurrentBlockchainStatus::Emission
@@ -154,7 +169,10 @@ CurrentBlockchainStatus::calculate_emission_in_blocks(
 
         (void) missed_txs;
 
-        emission_calculated.coinbase += coinbase_amount - tx_fee_amount;
+        // fees are taken off the 128-bit sum, not off coinbase_amount, so
+        // a block paying out less than its fees cant wrap around at 64 bits
+        emission_calculated.coinbase += coinbase_amount;
+        emission_calculated.coinbase -= tx_fee_amount;
         emission_calculated.fee      += tx_fee_amount;
 
         ++start_blk;
@@ -180,7 +198,7 @@ CurrentBlockchainStatus::save_current_emission_amount()
         return false;
     }
 
-    Emission current_emission = total_emission_atomic;
+    Emission current_emission = get_total_emission();
 
     out << string(current_emission) << flush;
 
@@ -214,16 +232,25 @@ CurrentBlockchainStatus::load_current_emission_amount()
 
     Emission emission_loaded {0, 0, 0};
 
-    uint64_t read_check_sum {0};
+    amount_t read_check_sum {0};
+
+    // amount_t would take "", "-5" or "010" (octal) without complaining
+    auto to_amount = [](const string& str)
+    {
+        if (str.empty() || !boost::all(str, boost::is_digit()))
+            throw boost::bad_lexical_cast();
+
+        return boost::lexical_cast<amount_t>(str);
+    };
 
     try
     {
         emission_loaded.blk_no   = boost::lexical_cast<uint64_t>(strs.at(0));
-        emission_loaded.coinbase = boost::lexical_cast<uint64_t>(strs.at(1));
-        emission_loaded.fee      = boost::lexical_cast<uint64_t>(strs.at(2));
-        read_check_sum           = boost::lexical_cast<uint64_t>(strs.at(3));
+        emission_loaded.coinbase = to_amount(strs.at(1));
+        emission_loaded.fee      = to_amount(strs.at(2));
+        read_check_sum           = to_amount(strs.at(3));
     }
-    catch (boost::bad_lexical_cast &e)
+    catch (const std::exception& e)
     {
         cerr << "Cant parse to number date from string: " << last_saved_emmision << endl;
         return false;
@@ -238,7 +265,7 @@ CurrentBlockchainStatus::load_current_emission_amount()
         return false;
     }
 
-    total_emission_atomic = emission_loaded;
+    set_total_emission(emission_loaded);
 
     return true;
 
@@ -255,7 +282,7 @@ CurrentBlockchainStatus::Emission
 CurrentBlockchainStatus::get_emission()
 {
     // get current emission
-    Emission current_emission = total_emission_atomic;
+    Emission current_emission = get_total_emission();
 
     // this emission will be few blocks behind current blockchain
     // height. By default 3 blocks. So we need to calcualate here
@@ -304,7 +331,10 @@ bf::path CurrentBlockchainStatus::blockchain_path {"/home/mwo/.bitmonero/lmdb"};
 
 cryptonote::network_type CurrentBlockchainStatus::nettype {cryptonote::network_type::MAINNET};
 
-string CurrentBlockchainStatus::output_file {"emission_amount.txt"};
+// Not emission_amount.txt: files with that name were written when the sums
+// were uint64_t. Their coinbase sum wrapped around at 2^64 atomic units
+// and would pass the checksum, so they must not be picked up.
+string CurrentBlockchainStatus::output_file {"emission_amount_v2.txt"};
 
 string CurrentBlockchainStatus::daemon_url {"http:://127.0.0.1:18081"};
 
@@ -314,7 +344,9 @@ uint64_t  CurrentBlockchainStatus::blockchain_chunk_gap {3};
 
 atomic<uint64_t> CurrentBlockchainStatus::current_height {0};
 
-atomic<CurrentBlockchainStatus::Emission> CurrentBlockchainStatus::total_emission_atomic;
+CurrentBlockchainStatus::Emission CurrentBlockchainStatus::total_emission {0, 0, 0};
+
+mutex CurrentBlockchainStatus::total_emission_mutex;
 
 boost::thread      CurrentBlockchainStatus::m_thread;
 

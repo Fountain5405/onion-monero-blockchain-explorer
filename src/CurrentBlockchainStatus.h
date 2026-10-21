@@ -8,6 +8,7 @@
 #include "MicroCore.h"
 
 #include <boost/algorithm/string.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
 
 #include <iostream>
 #include <memory>
@@ -25,13 +26,17 @@ namespace bf = boost::filesystem;
 struct CurrentBlockchainStatus
 {
 
+    // The total emission is above 2^64 atomic units (since block 3165917
+    // on mainnet), so it does not fit into uint64_t anymore.
+    using amount_t = boost::multiprecision::uint128_t;
+
     struct Emission
     {
-        uint64_t coinbase;
-        uint64_t fee;
+        amount_t coinbase;
+        amount_t fee;
         uint64_t blk_no;
 
-        inline uint64_t
+        inline amount_t
         checksum() const
         {
             return coinbase + fee + blk_no;
@@ -40,8 +45,8 @@ struct CurrentBlockchainStatus
         operator
         std::string() const
         {
-            return to_string(blk_no) + "," + to_string(coinbase)
-                   + "," + to_string(fee) + "," + to_string(checksum());
+            return to_string(blk_no) + "," + coinbase.str()
+                   + "," + fee.str() + "," + checksum().str();
         }
     };
 
@@ -56,7 +61,7 @@ struct CurrentBlockchainStatus
     // how many blocks to read before thread goes to sleep
     static uint64_t blockchain_chunk_size;
 
-    // gap from what we store total_emission_atomic and
+    // gap from what we store total_emission and
     // current blockchain height. We dont want to store
     // what is on, e.g., top block, as this can get messy
     // if the block gets orphaned or blockchain reorganization
@@ -69,7 +74,12 @@ struct CurrentBlockchainStatus
     static atomic<uint64_t> current_height;
 
 
-    static atomic<Emission> total_emission_atomic;
+    // Written by the emission thread, read by the http threads. Emission
+    // is not trivially copyable, so it cant be a std::atomic. Use
+    // get_total_emission() and set_total_emission() to access it.
+    static Emission total_emission;
+
+    static mutex total_emission_mutex;
 
 
     static boost::thread m_thread;
@@ -86,6 +96,12 @@ struct CurrentBlockchainStatus
     static void
     set_blockchain_variables(MicroCore* _mcore,
                              Blockchain* _core_storage);
+
+    static Emission
+    get_total_emission();
+
+    static void
+    set_total_emission(const Emission& emission);
 
     static void
     update_current_emission_amount();

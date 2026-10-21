@@ -243,12 +243,12 @@ main(int ac, const char* av[])
 
         // This thread stores the current emission
         // which it has caluclated in
-        // <blockchain_path>/emission_amount.txt file,
-        // e.g., ~/.bitmonero/lmdb/emission_amount.txt.
+        // <blockchain_path>/emission_amount_v2.txt file,
+        // e.g., ~/.bitmonero/lmdb/emission_amount_v2.txt.
         // So instead of calcualting the emission
         // from scrach whenever the explorer is started,
         // the thread is initalized with the values
-        // found in emission_amount.txt file.
+        // found in emission_amount_v2.txt file.
 
         xmreg::CurrentBlockchainStatus::blockchain_path
                 = blockchain_path;

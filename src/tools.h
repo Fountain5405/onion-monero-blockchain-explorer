@@ -275,9 +275,11 @@ decrypt(const std::string &ciphertext,
 public_key
 get_tx_pub_key_from_received_outs(const transaction &tx);
 
+// Amount is uint64_t, or a 128-bit type for sums which can exceed 2^64
+template <typename Amount>
 static
 string
-xmr_amount_to_str(const uint64_t& xmr_amount,
+xmr_amount_to_str(const Amount& xmr_amount,
                   string _format="{:0.12f}",
                   bool zero_to_question_mark=true)
 {

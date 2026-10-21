@@ -331,10 +331,10 @@ This flag will enable emission monitoring thread. When started, the thread
  will initially scan the entire blockchain, and calculate the cumulative emission based on each block.
 Since it is a separate thread, the explorer will work as usual during this time.
 Every 10000 blocks, the thread will save current emission in a file, by default,
- in `~/.bitmonero/lmdb/emission_amount.txt`. For testnet or stagenet networks,
- it is `~/.bitmonero/testnet/lmdb/emission_amount.txt` or `~/.bitmonero/stagenet/lmdb/emission_amount.txt`. This file is used so that we don't
+ in `~/.bitmonero/lmdb/emission_amount_v2.txt`. For testnet or stagenet networks,
+ it is `~/.bitmonero/testnet/lmdb/emission_amount_v2.txt` or `~/.bitmonero/stagenet/lmdb/emission_amount_v2.txt`. This file is used so that we don't
  need to rescan entire blockchain whenever the explorer is restarted. When the
- explorer restarts, the thread will first check if `~/.bitmonero/lmdb/emission_amount.txt`
+ explorer restarts, the thread will first check if `~/.bitmonero/lmdb/emission_amount_v2.txt`
  is present, read its values, and continue from there if possible. Subsequently, only the initial
  use of the thread is time consuming. Once the thread scans the entire blockchain, it updates
  the emission amount using new blocks as they come. Since the explorer writes this file, there can
@@ -353,6 +353,12 @@ Monero emission (fees) is 14485540.430 (52545.373) as of 1313448 block
 
 The values given, can be checked using Monero daemon's  `print_coinbase_tx_sum` command.
 For example, for the above example: `print_coinbase_tx_sum 0 1313449`.
+
+The total emission passed 2^64 atomic units (about 18446744.07 XMR) at mainnet block 3165917,
+so the sums are kept in 128 bit integers. Older versions used 64 bit ones, and the coinbase
+total wrapped around to a much smaller number. Those versions saved their progress in `emission_amount.txt`,
+which is not read anymore as it holds the wrapped value. After upgrading, the thread scans the
+entire blockchain once more and saves to `emission_amount_v2.txt`. The old file can be deleted.
 
 To disable the monitor, simply restart the explorer without `--enable-emission-monitor` flag.
 
@@ -845,12 +851,15 @@ curl  -w "\n" -X GET "http://127.0.0.1:8081/api/emission"
 {
   "data": {
     "blk_no": 1313969,
-    "coinbase": 14489473877253413000,
-    "fee": 52601974988641130
+    "coinbase": "14489473877253413000",
+    "fee": "52601974988641130"
   },
   "status": "success"
 }
 ```
+
+`coinbase` and `fee` are in atomic units. They are strings, as the total coinbase no longer fits
+into a 64 bit integer.
 
 Emission only works when the emission monitoring thread is enabled.
 
