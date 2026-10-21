@@ -28,7 +28,7 @@ parse_str_secret_key(const string& key_str, T& secret_key)
 
     if(!parse_hash256(key_str, hash_))
     {
-        cerr << "Cant parse a key (e.g. viewkey): " << key_str << endl;
+        cerr << "Cant parse a key (e.g. viewkey)" << endl; // dont log secret material
         return false;
     }
 
@@ -54,8 +54,12 @@ template bool parse_str_secret_key<crypto::hash>(const string& key_str, crypto::
 bool
 get_tx_pub_key_from_str_hash(Blockchain& core_storage, const string& hash_str, transaction& tx)
 {
-    crypto::hash tx_hash;
-    parse_hash256(hash_str, tx_hash);
+    crypto::hash tx_hash = crypto::null_hash;
+    if (!parse_hash256(hash_str, tx_hash))
+    {
+        cerr << "Cant parse tx hash: " << hash_str << endl;
+        return false;
+    }
 
     try
     {
@@ -167,8 +171,9 @@ timestamp_to_str_gm(time_t timestamp, const char* format)
 
     char str_buff[TIME_LENGTH];
 
-    std::tm tmp;
-    gmtime_r(t, &tmp);
+    std::tm tmp {};
+    if (gmtime_r(t, &tmp) == nullptr)
+        return "<unknown>";
 
     size_t len;
 
@@ -917,7 +922,7 @@ bool
 decode_ringct(const rct::rctSig& rv,
               const crypto::public_key pub,
               const crypto::secret_key &sec,
-              unsigned int i,
+              uint64_t i,
               rct::key & mask,
               uint64_t & amount)
 {
@@ -937,10 +942,22 @@ decode_ringct(const rct::rctSig& rv,
 bool
 decode_ringct(rct::rctSig const& rv,
               crypto::key_derivation const& derivation,
-              unsigned int i,
+              uint64_t i,
               rct::key& mask,
               uint64_t& amount)
 {
+    // The caller forms `mask` by indexing rv.ecdhInfo with this same i. Check it
+    // here as well as at the call sites: monero's decodeRct* validates the value
+    // it is passed, which is not necessarily the value used to form the
+    // reference it writes through.
+    if (i >= rv.ecdhInfo.size())
+    {
+        cerr << "decode_ringct: output index " << i
+             << " out of range (ecdhInfo.size() = " << rv.ecdhInfo.size()
+             << ")\n";
+        return false;
+    }
+
     try
     {
         crypto::secret_key scalar1;
@@ -954,7 +971,7 @@ decode_ringct(rct::rctSig const& rv,
             case rct::RCTTypeBulletproof2:
             case rct::RCTTypeCLSAG:
             case rct::RCTTypeBulletproofPlus:
-                amount = rct::decodeRctSimple(rv,
+                amount = rct::decodeRct(rv,
                                               rct::sk2rct(scalar1),
                                               i,
                                               mask,
@@ -1219,7 +1236,7 @@ make_printable(const string& in_s)
     for (char c: in_s)
     {
 
-        if (isprint(c))
+        if (isprint(static_cast<unsigned char>(c)))
         {
             output += c;
         }
@@ -1258,9 +1275,10 @@ get_human_readable_timestamp(uint64_t ts)
 
     time_t tt = ts;
 
-    struct tm tm;
+    struct tm tm {};
 
-    gmtime_r(&tt, &tm);
+    if (gmtime_r(&tt, &tm) == nullptr)
+        return "<unknown>";
 
     strftime(buffer, sizeof(buffer), "%Y-%m-%d %I:%M:%S", &tm);
 

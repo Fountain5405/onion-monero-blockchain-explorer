@@ -18,7 +18,7 @@
 #include "aes_hash.hpp"
 #include "assembly_generator_x86.hpp"
 
-#include "../gen/version.h"
+#include "../gen/xmrblocks_version.h"
 
 #include "MicroCore.h"
 #include "tools.h"
@@ -26,6 +26,13 @@
 
 #include "CurrentBlockchainStatus.h"
 #include "MempoolStatus.h"
+
+// Use Boost.Asio backend for Crow: Monero headers already pull in
+// <boost/asio/...>. Without this Crow includes standalone <asio.hpp>,
+// causing asio:: vs boost::asio:: ODR conflicts (prefer.hpp etc.).
+#ifndef CROW_USE_BOOST
+#define CROW_USE_BOOST
+#endif
 
 #include "../ext/crow_all.h"
 
@@ -98,6 +105,12 @@ inline thread_local RandomXThreadCleanup rx_thread_cleanup;
 
 #define ONIONEXPLORER_RPC_VERSION_MAJOR 1
 #define ONIONEXPLORER_RPC_VERSION_MINOR 3
+// App-layer DoS bounds (F5): independent of the 2 MiB POST body cap, so a
+// just-under-the-limit body still cannot buy unbounded CPU. Real mainnet
+// txs are far below these (outputs typically < 100, ring size 16).
+#define MAX_TX_VOUT_LOOKUP 2048u
+#define MAX_TX_VIN_LOOKUP 1024u
+#define MAX_RING_MEMBERS_LOOKUP 256u
 #define MAKE_ONIONEXPLORER_RPC_VERSION(major,minor) (((major)<<16)|(minor))
 #define ONIONEXPLORER_RPC_VERSION \
     MAKE_ONIONEXPLORER_RPC_VERSION(ONIONEXPLORER_RPC_VERSION_MAJOR, ONIONEXPLORER_RPC_VERSION_MINOR)
@@ -619,7 +632,10 @@ index2(uint64_t page_no = 0, bool refresh_page = false)
     uint64_t height = core_storage->get_current_blockchain_height();
 
     // number of last blocks to show
+    // guard against empty chain (height == 0) to avoid SIGFPE below
     uint64_t no_of_last_blocks = std::min(no_blocks_on_index + 1, height);
+    if (no_of_last_blocks == 0)
+        no_of_last_blocks = 1;
 
     // initalise page tempate map with basic info about blockchain
     mstch::map context {
@@ -837,7 +853,8 @@ index2(uint64_t page_no = 0, bool refresh_page = false)
         CurrentBlockchainStatus::Emission current_values
                 = CurrentBlockchainStatus::get_emission();
 
-        string emission_blk_no   = std::to_string(current_values.blk_no - 1);
+        string emission_blk_no   = std::to_string(current_values.blk_no > 0
+                ? current_values.blk_no - 1 : 0);
         string emission_coinbase = xmr_amount_to_str(current_values.coinbase, "{:0.3f}");
         string emission_fee      = xmr_amount_to_str(current_values.fee, "{:0.3f}");
 
@@ -1634,8 +1651,14 @@ show_ringmemberstx_hex(string const& tx_hash_str)
 
            if (!mcore->get_tx(mixin_tx_hash, mixin_tx))
            {
-               throw std::runtime_error("Cant get tx: "
-                                        + pod_to_hex(mixin_tx_hash));
+               // Returning beats throwing: crow does not wrap handler
+               // invocation, so an escaping exception unwinds into the asio
+               // worker loop and the response is never completed.
+               string out_msg = "Cant get tx: " + pod_to_hex(mixin_tx_hash);
+
+               cerr << out_msg << endl;
+
+               return out_msg;
            }
 
            // serialize tx
@@ -1974,7 +1997,8 @@ show_my_outputs(string tx_hash_str,
 
     if (!xmreg::parse_str_secret_key(viewkey_str, multiple_tx_secret_keys))
     {
-        cerr << "Cant parse the private key: " << viewkey_str << endl;
+        cerr << "Cant parse the private key: "
+             << mask_secret(viewkey_str) << endl;
         return string("Cant parse private key: " + viewkey_str);
     }
     if (multiple_tx_secret_keys.size() == 1)
@@ -2077,6 +2101,20 @@ show_my_outputs(string tx_hash_str,
 
     tx_details txd = get_tx_details(tx);
 
+    // Bound per-request CPU (F5): a single crafted tx must not buy seconds
+    // of key derivations + DB lookups, even if it fits the POST body cap.
+    if (tx.vout.size() > MAX_TX_VOUT_LOOKUP)
+        return string("Transaction has too many outputs to check");
+    if (tx.vin.size() > MAX_TX_VIN_LOOKUP)
+        return string("Transaction has too many inputs to check");
+    for (const auto& vin : tx.vin)
+    {
+        if (vin.type() == typeid(cryptonote::txin_to_key)
+            && boost::get<cryptonote::txin_to_key>(vin).key_offsets.size()
+                > MAX_RING_MEMBERS_LOOKUP)
+            return string("Transaction ring size too large to check");
+    }
+
     uint64_t tx_blk_height {0};
 
     bool tx_blk_found {false};
@@ -2116,18 +2154,17 @@ show_my_outputs(string tx_hash_str,
     string pid_str   = pod_to_hex(txd.payment_id);
     string pid8_str  = pod_to_hex(txd.payment_id8);
 
-    string shortcut_url = tx_prove 
-                    ? string("/prove") : string("/myoutputs")
-                          + '/' + tx_hash_str
-                          + '/' + xmr_address_str
-                          + '/' + viewkey_str;
+    // The shortcut link used to embed the private view key in the URL, which
+    // leaks it through Referer, browser history and any access log along the
+    // way. Link to the form instead; the user re-enters the key there.
+    //
+    // (The old expression also had a precedence bug: ?: binds looser than +,
+    // so the concatenation applied only to the /myoutputs branch and the prove
+    // shortcut collapsed to the bare string "/prove".)
+    string shortcut_url = tx_prove ? string("/prove") : string("/myoutputs");
 
 
-    string viewkey_str_partial = viewkey_str;
-
-    // dont show full private keys. Only file first and last letters
-    for (size_t i = 3; i < viewkey_str_partial.length() - 2; ++i)
-        viewkey_str_partial[i] = '*';
+    string viewkey_str_partial = mask_secret(viewkey_str);
 
     // initalise page tempate map with basic info about blockchain
     mstch::map context {
@@ -2180,7 +2217,8 @@ show_my_outputs(string tx_hash_str,
     {
         cerr << "Cant get derived key for: "  << "\n"
              << "pub_tx_key: " << pub_key << " and "
-             << "prv_view_key" << pod_to_hex(unwrap(unwrap(prv_view_key))) << endl;
+             << "prv_view_key " << mask_secret(
+                    pod_to_hex(unwrap(unwrap(prv_view_key)))) << endl;
 
         return string("Cant get key_derivation");
     }
@@ -2193,7 +2231,8 @@ show_my_outputs(string tx_hash_str,
         {
             cerr << "Cant get derived key for: "  << "\n"
                  << "pub_tx_key: " << txd.additional_pks[i] << " and "
-                 << "prv_view_key" << pod_to_hex(unwrap(unwrap(prv_view_key))) << endl;
+                 << "prv_view_key " << mask_secret(
+                        pod_to_hex(unwrap(unwrap(prv_view_key)))) << endl;
 
             return string("Cant get key_derivation");
         }
@@ -2268,7 +2307,7 @@ show_my_outputs(string tx_hash_str,
         {
             // cointbase txs have amounts in plain sight.
             // so use amount from ringct, only for non-coinbase txs
-            if (!is_coinbase(tx))
+            if (!tx.is_coinbase())
             {
 
                 // initialize with regular amount
@@ -2423,6 +2462,13 @@ show_my_outputs(string tx_hash_str,
             {
 
                 // get basic information about mixn's output
+                if (count >= mixin_outputs.size())
+                {
+                    cerr << "Mixin output " << count << " missing for key image "
+                         << pod_to_hex(in_key.k_image) << '\n';
+                    break;
+                }
+
                 cryptonote::output_data_t output_data = mixin_outputs.at(count);
 
                 tx_out_index tx_out_idx;
@@ -2589,15 +2635,21 @@ show_my_outputs(string tx_hash_str,
                     {
                         // cointbase txs have amounts in plain sight.
                         // so use amount from ringct, only for non-coinbase txs
-                        if (!is_coinbase(mixin_tx))
+                        if (!mixin_tx.is_coinbase())
                         {
                             // initialize with regular amount
                             uint64_t rct_amount = amount;
 
                             bool r;
 
+                            // output_idx_in_tx, not output_idx: the vector in
+                            // scope here is the inner one, sized by this mixin
+                            // transaction's additional pubkeys. output_idx belongs
+                            // to the enclosing loop over the *target* tx's outputs
+                            // and has already run to completion, so it is stale and
+                            // unrelated.
                             auto derivation_to_use = with_additional
-                                    ? additional_derivations[output_idx] : derivation;
+                                    ? additional_derivations[output_idx_in_tx] : derivation;
 
                             r = decode_ringct(
                                         mixin_tx.rct_signatures,
@@ -2843,11 +2895,10 @@ show_checkrawtx(string raw_tx_data, string action)
 
         try
         {
-            std::istringstream iss(s);
-            boost::archive::portable_binary_iarchive ar(iss);
-            ar >> exported_txs;
-
-            r = true;
+            binary_archive<false> ar{epee::strspan<std::uint8_t>(s)};
+            r = ::serialization::serialize(ar, exported_txs);
+            if (!r)
+                cerr << "Failed to parse unsigned tx data " << endl;
         }
         catch (...)
         {
@@ -2924,6 +2975,23 @@ show_checkrawtx(string raw_tx_data, string action)
                     //cout << "tx_source.real_out_tx_key: "         << tx_source.real_out_tx_key << endl;
                     //cout << "tx_source.real_output_in_tx_index: " << tx_source.real_output_in_tx_index << endl;
 
+                    // real_output indexes `outputs` and arrives from the
+                    // submitted blob. Reject rather than clamp: clamping would
+                    // let a malformed source reach the timescale code below,
+                    // which cannot cope with an empty mixin group.
+                    if (tx_source.real_output >= tx_source.outputs.size())
+                    {
+                        string out_msg = fmt::format(
+                                "Real output index {:d} is out of range "
+                                "({:d} ring members)",
+                                tx_source.real_output,
+                                tx_source.outputs.size());
+
+                        cerr << out_msg << endl;
+
+                        return string(out_msg);
+                    }
+
                     uint64_t index_of_real_output = tx_source.outputs[tx_source.real_output].first;
 
                     tx_out_index real_toi;
@@ -2963,6 +3031,21 @@ show_checkrawtx(string raw_tx_data, string action)
                     tx_details real_txd = get_tx_details(real_source_tx);
 
                     real_output_indices.push_back(tx_source.real_output);
+
+                    if (tx_source.real_output_in_tx_index
+                            >= real_txd.output_pub_keys.size())
+                    {
+                        string out_msg = fmt::format(
+                                "Output index {:d} is out of range for source "
+                                "tx {:s} ({:d} outputs)",
+                                tx_source.real_output_in_tx_index,
+                                pod_to_hex(real_txd.hash),
+                                real_txd.output_pub_keys.size());
+
+                        cerr << out_msg << endl;
+
+                        return string(out_msg);
+                    }
 
                     public_key real_out_pub_key = std::get<0>(real_txd.output_pub_keys[tx_source.real_output_in_tx_index]);
 
@@ -3193,11 +3276,10 @@ show_checkrawtx(string raw_tx_data, string action)
 
         try
         {
-            std::istringstream iss(s);
-            boost::archive::portable_binary_iarchive ar(iss);
-            ar >> signed_txs;
-
-            r = true;
+            binary_archive<false> ar{epee::strspan<std::uint8_t>(s)};
+            r = ::serialization::serialize(ar, signed_txs);
+            if (!r)
+                cerr << "Failed to parse signed tx data " << endl;
         }
         catch (...)
         {
@@ -3272,6 +3354,27 @@ show_checkrawtx(string raw_tx_data, string action)
             tx_context.insert({"dest_infos", destination_addresses});
 
             // get reference to inputs array created of the tx
+            // ptx.tx and ptx.construction_data are independent fields of the
+            // same submitted blob: the mstch arrays are sized from the
+            // transaction, real_ammounts/real_amounts from the construction
+            // data, and nothing has cross-checked them.
+            if (ptx.tx.vout.size()
+                    != ptx.construction_data.splitted_dsts.size() + 1
+                || ptx.tx.vin.size()
+                    != ptx.construction_data.sources.size())
+            {
+                return string(
+                        "Transaction and its construction data disagree: "
+                        + std::to_string(ptx.tx.vin.size()) + " inputs / "
+                        + std::to_string(ptx.tx.vout.size()) + " outputs "
+                        "against "
+                        + std::to_string(ptx.construction_data.sources.size())
+                        + " sources / "
+                        + std::to_string(
+                                ptx.construction_data.splitted_dsts.size())
+                        + " destinations");
+            }
+
             mstch::array& outputs = boost::get<mstch::array>(tx_context["outputs"]);
 
             // show real output amount for ringct outputs.
@@ -3307,6 +3410,18 @@ show_checkrawtx(string raw_tx_data, string action)
             {
                 transaction real_source_tx;
 
+                if (tx_source.real_output >= tx_source.outputs.size())
+                {
+                    string out_msg = fmt::format(
+                            "Real output index {:d} is out of range "
+                            "({:d} ring members)",
+                            tx_source.real_output, tx_source.outputs.size());
+
+                    cerr << out_msg << endl;
+
+                    return string(out_msg);
+                }
+
                 uint64_t index_of_real_output = std::get<0>(tx_source.outputs[tx_source.real_output]);
 
                 uint64_t tx_source_amount = (tx_source.rct ? 0 : tx_source.amount);
@@ -3339,6 +3454,21 @@ show_checkrawtx(string raw_tx_data, string action)
                 }
 
                 tx_details real_txd = get_tx_details(real_source_tx);
+
+                if (tx_source.real_output_in_tx_index
+                        >= real_txd.output_pub_keys.size())
+                {
+                    string out_msg = fmt::format(
+                            "Output index {:d} is out of range for source "
+                            "tx {:s} ({:d} outputs)",
+                            tx_source.real_output_in_tx_index,
+                            pod_to_hex(real_txd.hash),
+                            real_txd.output_pub_keys.size());
+
+                    cerr << out_msg << endl;
+
+                    return string(out_msg);
+                }
 
                 public_key real_out_pub_key
                         = std::get<0>(real_txd.output_pub_keys[tx_source.real_output_in_tx_index]);
@@ -3455,6 +3585,17 @@ show_pushrawtx(string raw_tx_data, string action)
     std::vector<tools::wallet2::pending_tx> ptx_vector;
 
     // first try reading raw_tx_data as a raw hex string
+    // (same enable_pusher gate as the base64 branch below, so the
+    //  guard does not depend solely on route registration)
+    if (this->enable_pusher == false)
+    {
+        context["has_error"] = true;
+        context["error_msg"] = "Pushing disabled!\n "
+                "Run explorer with --enable-pusher flag to enable it.";
+
+        return mstch::render(full_page, context);
+    }
+
     std::string tx_blob;
     cryptonote::transaction parsed_tx;
     crypto::hash parsed_tx_hash, parsed_tx_prefixt_hash;
@@ -3505,11 +3646,10 @@ show_pushrawtx(string raw_tx_data, string action)
 
         try
         {
-            std::istringstream iss(s);
-            boost::archive::portable_binary_iarchive ar(iss);
-            ar >> signed_txs;
-
-            r = true;
+            binary_archive<false> ar{epee::strspan<std::uint8_t>(s)};
+            r = ::serialization::serialize(ar, signed_txs);
+            if (!r)
+                cerr << "Failed to parse signed tx data " << endl;
         }
         catch (...)
         {
@@ -3774,8 +3914,8 @@ show_checkrawkeyimgs(string raw_data, string viewkey_str)
 
     context.insert({"address"        , REMOVE_HASH_BRAKETS(
             xmreg::print_address(address_info, nettype))});
-    context.insert({"viewkey"        , REMOVE_HASH_BRAKETS(
-            fmt::format("{:s}", pod_to_hex(unwrap(unwrap(prv_view_key)))))});
+    context.insert({"viewkey"        , mask_secret(REMOVE_HASH_BRAKETS(
+            fmt::format("{:s}", pod_to_hex(unwrap(unwrap(prv_view_key))))))});
     context.insert({"has_total_xmr"  , false});
     context.insert({"total_xmr"      , string{}});
     context.insert({"key_imgs"       , mstch::array{}});
@@ -3899,6 +4039,17 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
     // header is public spend and keys
     const size_t header_lenght    = 2 * sizeof(crypto::public_key);
 
+    if (decoded_raw_data.size() < header_lenght)
+    {
+        string error_msg = fmt::format(
+                "Bad data size from submitted output keys raw data.");
+
+        context["has_error"] = true;
+        context["error_msg"] = error_msg;
+
+        return mstch::render(full_page, context);
+    }
+
     // get xmr address stored in this key image file
     const account_public_address* xmr_address =
             reinterpret_cast<const account_public_address*>(
@@ -3908,7 +4059,8 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
 
     context.insert({"address"        , REMOVE_HASH_BRAKETS(
             xmreg::print_address(address_info, nettype))});
-    context.insert({"viewkey"        , pod_to_hex(unwrap(unwrap(prv_view_key)))});
+    context.insert({"viewkey"        , mask_secret(
+            pod_to_hex(unwrap(unwrap(prv_view_key))))});
     context.insert({"has_total_xmr"  , false});
     context.insert({"total_xmr"      , string{}});
     context.insert({"output_keys"    , mstch::array{}});
@@ -3927,6 +4079,15 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
         //boost::archive::binary_iarchive ar(iss);
 
         ar >> outputs;
+
+        // Bound per-request CPU: a crafted export must not buy unbounded
+        // per-output work below. Covers the body cap like the tx path.
+        if (outputs.size() > MAX_TX_VOUT_LOOKUP)
+        {
+            context["has_error"] = true;
+            context["error_msg"] = "Too many outputs to check";
+            return mstch::render(full_page, context);
+        }
 
         //size_t n_outputs = m_wallet->import_outputs(outputs);
     }
@@ -3976,8 +4137,24 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
 
             // cointbase txs have amounts in plain sight.
             // so use amount from ringct, only for non-coinbase txs
-            if (!is_coinbase(tx))
+            if (!tx.is_coinbase())
             {
+
+                // m_internal_output_index is attacker-controlled: it arrives
+                // through boost deserialisation of the submitted blob and is not
+                // related to this transaction until checked against it.
+                if (td.m_internal_output_index
+                        >= tx.rct_signatures.ecdhInfo.size())
+                {
+                    string error_msg = fmt::format(
+                            "Output index {:d} is out of range for tx {:s}",
+                            td.m_internal_output_index, pod_to_hex(td.m_txid));
+
+                    context["has_error"] = true;
+                    context["error_msg"] = error_msg;
+
+                    return mstch::render(full_page, context);
+                }
 
                 bool r = decode_ringct(tx.rct_signatures,
                                        tx_pub_key,
@@ -3985,12 +4162,17 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
                                        td.m_internal_output_index,
                                        tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
                                        xmr_amount);
-                r = r || decode_ringct(tx.rct_signatures,
-                                       additional_tx_pub_keys[td.m_internal_output_index],
-                                       prv_view_key,
-                                       td.m_internal_output_index,
-                                       tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
-                                       xmr_amount);
+
+                if (!r && td.m_internal_output_index
+                              < additional_tx_pub_keys.size())
+                {
+                    r = decode_ringct(tx.rct_signatures,
+                                      additional_tx_pub_keys[td.m_internal_output_index],
+                                      prv_view_key,
+                                      td.m_internal_output_index,
+                                      tx.rct_signatures.ecdhInfo[td.m_internal_output_index].mask,
+                                      xmr_amount);
+                }
 
                 if (!r)
                 {
@@ -4004,7 +4186,7 @@ show_checkcheckrawoutput(string raw_data, string viewkey_str)
                     return mstch::render(full_page, context);
                 }
 
-            } //  if (!is_coinbase(tx))
+            } //  if (!tx.is_coinbase())
 
         } // if (td.is_rct())
 
@@ -4470,7 +4652,7 @@ json_transaction(string tx_hash_str)
     }
 
     uint64_t block_height {0};
-    uint64_t is_coinbase_tx = is_coinbase(tx);
+    uint64_t is_coinbase_tx = tx.is_coinbase();
     uint64_t no_confirmations {0};
 
     if (found_in_mempool == false)
@@ -5461,7 +5643,7 @@ json_outputs(string tx_hash_str,
         {
             // cointbase txs have amounts in plain sight.
             // so use amount from ringct, only for non-coinbase txs
-            if (!is_coinbase(tx))
+            if (!tx.is_coinbase())
             {
 
                 // initialize with regular amount
@@ -5486,7 +5668,7 @@ json_outputs(string tx_hash_str,
                 xmr_amount         = rct_amount;
                 money_transfered[output_idx] = rct_amount;
 
-            } // if (!is_coinbase(tx))
+            } // if (!tx.is_coinbase())
 
         }  // if (mine_output && tx.version == 2)
 
@@ -5751,13 +5933,9 @@ json_networkinfo()
 
     uint64_t per_kb_fee_estimated {0};
 
-    // get dynamic fee estimate from last 10 blocks
-    if (!get_dynamic_per_kb_fee_estimate(per_kb_fee_estimated))
-    {
-        j_response["status"]  = "error";
-        j_response["message"] = "Cant get per kb dynamic fee esimate";
-    //    return j_response;
-    }
+    // use the fee cached by the mempool thread, not a per-request daemon RPC
+    // (the live call is serialized under a 200s-timeout mutex -> worker starvation)
+    per_kb_fee_estimated = MempoolStatus::current_network_info.load().fee_per_kb;
 
     j_info["fee_per_kb"] = per_kb_fee_estimated;
     j_info["fee_estimate"] = per_kb_fee_estimated;
@@ -5805,20 +5983,11 @@ json_feeestimate(string grace_blocks_str)
         }
     }
 
-    uint64_t fee_estimated {0};
-    string error_msg;
-
-    if (!rpc.get_dynamic_per_kb_fee_estimate(
-            grace_blocks,
-            fee_estimated,
-            error_msg))
-    {
-        j_response["status"] = "error";
-        j_response["message"] = error_msg.empty()
-                                ? "Cant get dynamic fee estimate"
-                                : error_msg;
-        return j_response;
-    }
+    // Use the fee cached by the mempool thread, not a per-request daemon
+    // RPC (the live call is serialized under a 200s-timeout mutex, letting
+    // one slow daemon stall all Crow workers — same fix as json_networkinfo).
+    // grace_blocks is kept in the response for API compatibility.
+    uint64_t fee_estimated = MempoolStatus::current_network_info.load().fee_per_kb;
 
     j_data = json {
             {"fee", fee_estimated},
@@ -5862,7 +6031,7 @@ json_emission()
         // coinbase does not fit into a json integer (uint64_t) anymore,
         // so the amounts, in atomic units, are given as decimal strings
         j_data = json {
-                {"blk_no"  , current_values.blk_no - 1},
+                {"blk_no"  , current_values.blk_no > 0 ? current_values.blk_no - 1 : 0},
                 {"coinbase", current_values.coinbase.str()},
                 {"fee"     , current_values.fee.str()},
         };
@@ -6032,7 +6201,7 @@ find_our_outputs(
             {
                 // cointbase txs have amounts in plain sight.
                 // so use amount from ringct, only for non-coinbase txs
-                if (!is_coinbase(tx))
+                if (!tx.is_coinbase())
                 {
 
                     // initialize with regular amount
@@ -6061,7 +6230,7 @@ find_our_outputs(
                     xmr_amount = rct_amount;
                     money_transfered[output_idx] = rct_amount;
 
-                } // if (!is_coinbase(tx))
+                } // if (!tx.is_coinbase())
 
             }  // if (mine_output && tx.version == 2)
 
@@ -6102,7 +6271,7 @@ get_tx_json(const transaction& tx, const tx_details& txd)
             {"xmr_inputs"  , txd.xmr_inputs},
             {"tx_version"  , static_cast<uint64_t>(txd.version)},
             {"rct_type"    , tx.rct_signatures.type},
-            {"coinbase"    , is_coinbase(tx)},
+            {"coinbase"    , tx.is_coinbase()},
             {"mixin"       , txd.mixin_no},
             {"extra"       , txd.get_extra_str()},
             {"payment_id"  , (txd.payment_id  != null_hash  ? pod_to_hex(txd.payment_id)  : "")},
@@ -6173,6 +6342,14 @@ mark_real_mixins_on_timescales(
 
         size_t point_to_find = real_output_indices.at(idx);
 
+        // no timescale points: nothing to mark (also avoids
+        // no_points - 1 wrapping to SIZE_MAX)
+        if (no_points == 0)
+        {
+            ++idx;
+            continue;
+        }
+
         // adjust point to find based on total number of points
         if (point_to_find >= no_points)
             point_to_find = no_points  - 1;
@@ -6180,7 +6357,8 @@ mark_real_mixins_on_timescales(
         boost::iterator_range<string::iterator> r
                 = boost::find_nth(timescale, "*", point_to_find);
 
-        *(r.begin()) = 'R';
+        if (!r.empty())
+            *(r.begin()) = 'R';
 
         ++idx;
     }
@@ -6459,6 +6637,8 @@ construct_tx_context(transaction tx, uint16_t with_ring_signatures = 0)
                     context["has_error"] = true;
                     context["error_msg"] = fmt::format("- cant get block of height: {}",
                                                        output_data.height);
+
+                    return context;
                 }
 
                 // get age of mixin relative to server time
@@ -6474,6 +6654,8 @@ construct_tx_context(transaction tx, uint16_t with_ring_signatures = 0)
 
                     context["has_error"] = true;
                     context["error_msg"] = fmt::format("Cant get tx: {:s}", tx_out_idx.first);
+
+                    return context;
                 }
 
                 // mixin tx details
@@ -6603,7 +6785,7 @@ construct_tx_context(transaction tx, uint16_t with_ring_signatures = 0)
 
         // outputs in tx in them mempool dont have yet global indices
         // thus for them, we print N/A
-        if (!out_amount_indices.empty())
+        if (output_idx < out_amount_indices.size())
         {
             out_amount_index_str
                     = std::to_string(out_amount_indices.at(output_idx));
@@ -6659,6 +6841,8 @@ construct_mstch_mixin_timescales(
     // find min and maximum timestamps
     for (const vector<uint64_t>& mixn_timestamps : mixin_timestamp_groups)
     {
+        if (mixn_timestamps.empty())
+            continue;
 
         uint64_t min_found = *min_element(mixn_timestamps.begin(), mixn_timestamps.end());
         uint64_t max_found = *max_element(mixn_timestamps.begin(), mixn_timestamps.end());
@@ -6717,7 +6901,7 @@ get_tx_details(const transaction& tx,
     }
     else
     {
-        txd.hash = get_pruned_transaction_hash(tx, tx.prunable_hash);
+        get_pruned_transaction_hash(tx, tx.prunable_hash, txd.hash);
     }
 
     // get tx public key from extra
@@ -6792,6 +6976,20 @@ get_tx_details(const transaction& tx,
     }
 
     return txd;
+}
+
+// Show only the first and last few characters of a secret. Used everywhere a
+// submitted view key or tx secret key would otherwise be echoed back to the
+// client or written to a log.
+string
+mask_secret(string const& secret)
+{
+    if (secret.length() <= 8)
+        return string(secret.length(), '*');
+
+    return secret.substr(0, 3)
+           + string(secret.length() - 5, '*')
+           + secret.substr(secret.length() - 2);
 }
 
 void
@@ -7000,6 +7198,10 @@ are_absolute_offsets_good(
         std::vector<uint64_t> const& absolute_offsets,
         txin_to_key const& in_key)
 {
+
+    if (absolute_offsets.empty())
+        return false;
+
     // before proceeding with geting the outputs based on the amount and absolute offset
     // check how many outputs there are for that amount
     uint64_t no_outputs = core_storage->get_db().get_num_outputs(in_key.amount);

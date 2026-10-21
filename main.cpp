@@ -1,3 +1,6 @@
+#ifndef CROW_USE_BOOST
+#define CROW_USE_BOOST
+#endif
 #define CROW_ENABLE_SSL
 #define CROW_MAIN
 
@@ -14,6 +17,23 @@ using boost::filesystem::path;
 using xmreg::remove_bad_chars;
 
 using namespace std;
+
+namespace
+{
+// App-layer replacement for the vendored Crow body cap (ext/crow_all.h
+// is vendored and must not be patched): reject oversized POST bodies
+// before parse_crow_post_data makes extra copies (F1), and bound the
+// CPU amplification from crafted txs (F5).
+constexpr size_t MAX_POST_BODY_SIZE = 2u * 1024u * 1024u; // 2 MiB
+
+inline bool
+post_body_too_large(const crow::request& req)
+{
+    return req.body.size() > MAX_POST_BODY_SIZE;
+}
+
+inline const char* BODY_TOO_LARGE_MSG = "Request body too large (2 MiB limit)";
+}
 
 namespace myxmr
 {
@@ -163,6 +183,12 @@ main(int ac, const char* av[])
 
 
     // check if ssl enabled and files exist
+
+    if (bool(ssl_crt_file_opt) != bool(ssl_key_file_opt))
+    {
+        cerr << "Both --ssl-crt-file and --ssl-key-file are required for SSL!" << endl;
+        return EXIT_FAILURE;
+    }
 
     if (ssl_crt_file_opt && ssl_key_file_opt)
     {
@@ -326,7 +352,21 @@ main(int ac, const char* av[])
     // crow instance
     crow::SimpleApp app;
 
+    // dont log request/response URLs (they carry view keys, tx keys, client IPs)
+    app.loglevel(crow::LogLevel::Warning);
+
     // get domian url based on the request
+    // crow's url_params.get() returns nullptr for an absent key, and
+    // constructing std::string from nullptr is undefined behaviour (libstdc++
+    // throws std::logic_error; libc++ dereferences it). Always go through this.
+    auto get_param = [](crow::request const& req,
+                        char const* name,
+                        string const& dflt = string {}) -> string
+    {
+        char const* value = req.url_params.get(name);
+        return value ? string(value) : dflt;
+    };
+
     auto get_domain = [&use_ssl](crow::request const& req) {
         return (use_ssl ? "https://" : "http://")
                + req.get_header_value("Host");
@@ -435,6 +475,8 @@ main(int ac, const char* av[])
     CROW_ROUTE(app, "/myoutputs").methods("POST"_method)
     ([&](const crow::request& req) -> myxmr::htmlresponse
      {
+        if (post_body_too_large(req))
+            return string(BODY_TOO_LARGE_MSG);
 
         map<std::string, std::string> post_body
                 = xmreg::parse_crow_post_data(req.body);
@@ -464,24 +506,14 @@ main(int ac, const char* av[])
         return myxmr::htmlresponse(std::move(response));
     });
 
-    CROW_ROUTE(app, "/myoutputs/<string>/<string>/<string>")
-    ([&](const crow::request& req, string tx_hash,
-        string xmr_address, string viewkey)
-     {
-
-        string domain = get_domain(req);
-
-        return myxmr::htmlresponse(xmrblocks.show_my_outputs(
-                                         remove_bad_chars(tx_hash),
-                                         remove_bad_chars(xmr_address),
-                                         remove_bad_chars(viewkey),
-                                         string {},
-                                         domain));
-    });
+    // GET /myoutputs/<tx>/<addr>/<viewkey> removed: it puts the secret view key
+    // in the URL (Referer, history, access logs). Use the POST form instead.
 
     CROW_ROUTE(app, "/prove").methods("POST"_method)
-        ([&](const crow::request& req) -> myxmr::htmlresponse 
+        ([&](const crow::request& req) -> myxmr::htmlresponse
          {
+            if (post_body_too_large(req))
+                return string(BODY_TOO_LARGE_MSG);
 
             map<std::string, std::string> post_body
                     = xmreg::parse_crow_post_data(req.body);
@@ -512,20 +544,8 @@ main(int ac, const char* av[])
     });
 
 
-    CROW_ROUTE(app, "/prove/<string>/<string>/<string>")
-    ([&](const crow::request& req, string tx_hash,
-         string xmr_address, string tx_prv_key) 
-     {
-
-        string domain = get_domain(req);
-
-        return myxmr::htmlresponse(xmrblocks.show_prove(
-                                    remove_bad_chars(tx_hash),
-                                    remove_bad_chars(xmr_address),
-                                    remove_bad_chars(tx_prv_key),
-                                    string {},
-                                    domain));
-    });
+    // GET /prove/<tx>/<addr>/<txprvkey> removed: it puts the secret tx private key
+    // in the URL. Use the POST form instead.
 
     if (enable_pusher)
     {
@@ -537,6 +557,8 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/checkandpush").methods("POST"_method)
         ([&](const crow::request& req) -> myxmr::htmlresponse
          {
+            if (post_body_too_large(req))
+                return string(BODY_TOO_LARGE_MSG);
 
             map<std::string, std::string> post_body
                     = xmreg::parse_crow_post_data(req.body);
@@ -571,6 +593,8 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/checkrawkeyimgs").methods("POST"_method)
         ([&](const crow::request& req) -> myxmr::htmlresponse
          {
+            if (post_body_too_large(req))
+                return string(BODY_TOO_LARGE_MSG);
 
             map<std::string, std::string> post_body
                     = xmreg::parse_crow_post_data(req.body);
@@ -604,6 +628,8 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/checkrawoutputkeys").methods("POST"_method)
         ([&](const crow::request& req) -> myxmr::htmlresponse
          {
+            if (post_body_too_large(req))
+                return string(BODY_TOO_LARGE_MSG);
 
             map<std::string, std::string> post_body
                     = xmreg::parse_crow_post_data(req.body);
@@ -633,7 +659,7 @@ main(int ac, const char* av[])
         return myxmr::htmlresponse(
                 xmrblocks.search(
                     remove_bad_chars(
-                        string(req.url_params.get("value")))));
+                        get_param(req, "value"))));
     });
 
     CROW_ROUTE(app, "/mempool")
@@ -707,11 +733,9 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/api/transactions").methods("GET"_method)
         ([&](const crow::request &req) {
 
-            string page = regex_search(req.raw_url, regex {"page=\\d+"}) ?
-                          req.url_params.get("page") : "0";
+            string page  = get_param(req, "page", "0");
 
-            string limit = regex_search(req.raw_url, regex {"limit=\\d+"}) ?
-                           req.url_params.get("limit") : "25";
+            string limit = get_param(req, "limit", "25");
 
             myxmr::jsonresponse r{xmrblocks.json_transactions(
                     remove_bad_chars(page), remove_bad_chars(limit))};
@@ -722,14 +746,12 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/api/mempool").methods("GET"_method)
         ([&](const crow::request &req) {
 
-            string page = regex_search(req.raw_url, regex {"page=\\d+"}) ?
-                          req.url_params.get("page") : "0";
+            string page = get_param(req, "page", "0");
 
             // default value for limit is some large number, so that
             // a call to api/mempool without any limit return all
             // mempool txs
-            string limit = regex_search(req.raw_url, regex {"limit=\\d+"}) ?
-                           req.url_params.get("limit") : "100000000";
+            string limit = get_param(req, "limit", "100000000");
 
             myxmr::jsonresponse r{xmrblocks.json_mempool(
                     remove_bad_chars(page), remove_bad_chars(limit))};
@@ -756,9 +778,7 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/api/feeestimate").methods("GET"_method)
         ([&](const crow::request &req) {
 
-            string grace_blocks = regex_search(
-                    req.raw_url, regex {"grace_blocks=\\d+"}) ?
-                                  req.url_params.get("grace_blocks") : "";
+            string grace_blocks = get_param(req, "grace_blocks");
 
             myxmr::jsonresponse r{xmrblocks.json_feeestimate(
                     remove_bad_chars(grace_blocks))};
@@ -777,22 +797,20 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/api/outputs").methods("GET"_method)
         ([&](const crow::request &req) {
 
-            string tx_hash = regex_search(req.raw_url, regex {"txhash=\\w+"}) ?
-                             req.url_params.get("txhash") : "";
+            string tx_hash = get_param(req, "txhash");
 
-            string address = regex_search(req.raw_url, regex {"address=\\w+"}) ?
-                             req.url_params.get("address") : "";
+            string address = get_param(req, "address");
 
-            string viewkey = regex_search(req.raw_url, regex {"viewkey=\\w+"}) ?
-                             req.url_params.get("viewkey") : "";
+            string viewkey = get_param(req, "viewkey");
 
             bool tx_prove{false};
 
             try
             {
-                tx_prove = regex_search(req.raw_url, regex {"txprove=[01]"}) ?
-                           boost::lexical_cast<bool>(req.url_params.get("txprove")) :
-                           false;
+                string txprove = get_param(req, "txprove");
+                tx_prove = txprove.empty()
+                           ? false
+                           : boost::lexical_cast<bool>(txprove);
             }
             catch (const boost::bad_lexical_cast &e)
             {
@@ -811,27 +829,22 @@ main(int ac, const char* av[])
         CROW_ROUTE(app, "/api/outputsblocks").methods("GET"_method)
         ([&](const crow::request &req) {
 
-            string startblock = regex_search(req.raw_url, regex {"startblock=\\d+"}) ?
-                           req.url_params.get("startblock") : "";
+            string startblock = get_param(req, "startblock");
 
-            string endblock = regex_search(req.raw_url, regex {"endblock=\\d+"}) ?
-                           req.url_params.get("endblock") : "";
+            string endblock = get_param(req, "endblock");
 
-            string address = regex_search(req.raw_url, regex {"address=\\w+"}) ?
-                             req.url_params.get("address") : "";
+            string address = get_param(req, "address");
 
-            string viewkey = regex_search(req.raw_url, regex {"viewkey=\\w+"}) ?
-                             req.url_params.get("viewkey") : "";
+            string viewkey = get_param(req, "viewkey");
 
             bool in_mempool_aswell {false};
 
             try
             {
-                in_mempool_aswell = regex_search(
-                        req.raw_url, regex {"mempool=[01]"}) ?
-                           boost::lexical_cast<bool>(
-                                   req.url_params.get("mempool")) :
-                           false;
+                string mempool = get_param(req, "mempool");
+                in_mempool_aswell = mempool.empty()
+                                    ? false
+                                    : boost::lexical_cast<bool>(mempool);
             }
             catch (const boost::bad_lexical_cast &e)
             {
