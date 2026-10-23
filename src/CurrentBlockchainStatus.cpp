@@ -168,7 +168,11 @@ CurrentBlockchainStatus::calculate_emission_in_blocks(
         (void) missed_txs;
 
         // fees are taken off the 128-bit sum, not off coinbase_amount, so
-        // a block paying out less than its fees cant wrap around at 64 bits
+        // a block paying out less than its fees cant wrap around at 64 bits.
+        // The sum can still dip below zero and wrap at 2^128 if such a block
+        // starts a chunk; it comes back right as later blocks are added,
+        // because amount_t arithmetic is modular and the true total is
+        // never negative.
         emission_calculated.coinbase += coinbase_amount;
         emission_calculated.coinbase -= tx_fee_amount;
         emission_calculated.fee      += tx_fee_amount;
@@ -186,26 +190,50 @@ bool
 CurrentBlockchainStatus::save_current_emission_amount()
 {
 
-    string emmision_saved_file = get_output_file_path().string();
+    bf::path emmision_saved_file = get_output_file_path();
 
-    // dont follow a symlink planted at the emission file path
-    if (boost::filesystem::is_symlink(emmision_saved_file))
+    // write a temp file and rename it over the real one, so a crash or a
+    // full disk mid-write cant leave a truncated file, which the loader
+    // would reject on the next start
+    bf::path emmision_tmp_file = emmision_saved_file;
+    emmision_tmp_file += ".tmp";
+
+    // dont follow a symlink planted at either path
+    if (bf::is_symlink(emmision_saved_file) || bf::is_symlink(emmision_tmp_file))
     {
         cerr << "Emission file is a symlink; refusing to write." << endl;
         return false;
     }
 
-    ofstream out(emmision_saved_file);
-
-    if( !out )
-    {
-        cerr << "Couldn't open file."  << endl;
-        return false;
-    }
-
     Emission current_emission = get_total_emission();
 
-    out << string(current_emission) << flush;
+    {
+        ofstream out(emmision_tmp_file.string());
+
+        if( !out )
+        {
+            cerr << "Couldn't open file."  << endl;
+            return false;
+        }
+
+        out << string(current_emission) << flush;
+
+        if( !out )
+        {
+            cerr << "Couldn't write emission file." << endl;
+            return false;
+        }
+    }
+
+    boost::system::error_code ec;
+
+    bf::rename(emmision_tmp_file, emmision_saved_file, ec);
+
+    if (ec)
+    {
+        cerr << "Couldn't replace emission file: " << ec.message() << endl;
+        return false;
+    }
 
     return true;
 }
@@ -239,17 +267,29 @@ CurrentBlockchainStatus::load_current_emission_amount()
 
     amount_t read_check_sum {0};
 
-    // amount_t would take "", "-5" or "010" (octal) without complaining
-    auto to_amount = [](const string& str)
+    // only plain decimal is accepted: the casts below would otherwise
+    // read "010" as octal and wrap "-5" around to a huge number
+    auto check_decimal = [](const string& str)
     {
-        if (str.empty() || !boost::all(str, boost::is_digit()))
+        if (str.empty() || !boost::all(str, boost::is_digit())
+            || (str.size() > 1 && str[0] == '0'))
             throw boost::bad_lexical_cast();
+    };
 
-        return boost::lexical_cast<amount_t>(str);
+    // checked_uint128_t throws on values above 2^128, which amount_t
+    // would silently truncate
+    auto to_amount = [&check_decimal](const string& str)
+    {
+        check_decimal(str);
+
+        return static_cast<amount_t>(
+                boost::multiprecision::checked_uint128_t {str.c_str()});
     };
 
     try
     {
+        check_decimal(strs.at(0));
+
         emission_loaded.blk_no   = boost::lexical_cast<uint64_t>(strs.at(0));
         emission_loaded.coinbase = to_amount(strs.at(1));
         emission_loaded.fee      = to_amount(strs.at(2));
