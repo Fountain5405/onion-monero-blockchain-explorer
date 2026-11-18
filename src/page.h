@@ -5923,19 +5923,29 @@ json_networkinfo()
 
     json j_info;
 
+    // errors are kept in "message" and reported in "status" at the end;
+    // the rest of the data is still returned
+    bool ok {true};
+
     // get basic network info
     if (!get_monero_network_info(j_info))
     {
-        j_response["status"]  = "error";
+        ok = false;
         j_response["message"] = "Cant get monero network info";
-    //    return j_response;
     }
-
-    uint64_t per_kb_fee_estimated {0};
 
     // use the fee cached by the mempool thread, not a per-request daemon RPC
     // (the live call is serialized under a 200s-timeout mutex -> worker starvation)
-    per_kb_fee_estimated = MempoolStatus::current_network_info.load().fee_per_kb;
+    MempoolStatus::network_info cached_network_info
+            = MempoolStatus::current_network_info;
+
+    uint64_t per_kb_fee_estimated {cached_network_info.fee_per_kb};
+
+    if (!cached_network_info.current)
+    {
+        ok = false;
+        j_response["message"] = "Cached network info is stale; cant get per kb dynamic fee esimate";
+    }
 
     j_info["fee_per_kb"] = per_kb_fee_estimated;
     j_info["fee_estimate"] = per_kb_fee_estimated;
@@ -5946,7 +5956,7 @@ json_networkinfo()
 
     j_data = j_info;
 
-    j_response["status"]  = "success";
+    j_response["status"]  = ok ? "success" : "error";
 
     return j_response;
 }

@@ -77,7 +77,8 @@ CurrentBlockchainStatus::start_monitor_blockchain_thread()
 
                        save_current_emission_amount();
 
-                       if (current_emission.blk_no < current_height - blockchain_chunk_size)
+                       if (current_height > blockchain_chunk_size
+                           && current_emission.blk_no < current_height - blockchain_chunk_size)
                        {
                            // while we scan the blockchain from scrach, every 10000
                            // blocks take 1 second break
@@ -198,11 +199,25 @@ CurrentBlockchainStatus::save_current_emission_amount()
     bf::path emmision_tmp_file = emmision_saved_file;
     emmision_tmp_file += ".tmp";
 
-    // dont follow a symlink planted at either path
-    if (bf::is_symlink(emmision_saved_file) || bf::is_symlink(emmision_tmp_file))
+    // dont follow a symlink planted at either path. The error_code
+    // overload is used because the throwing one would escape the monitor
+    // thread (e.g. on a permission error) and terminate the explorer.
+    for (const bf::path& path : {emmision_saved_file, emmision_tmp_file})
     {
-        cerr << "Emission file is a symlink; refusing to write." << endl;
-        return false;
+        boost::system::error_code ec;
+
+        if (bf::is_symlink(path, ec))
+        {
+            cerr << "Emission file is a symlink; refusing to write." << endl;
+            return false;
+        }
+
+        if (ec && ec != boost::system::errc::no_such_file_or_directory)
+        {
+            cerr << "Emission file path could not be inspected: " << path
+                 << " (" << ec.message() << "); refusing to write." << endl;
+            return false;
+        }
     }
 
     Emission current_emission = get_total_emission();
